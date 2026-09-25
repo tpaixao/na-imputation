@@ -1,0 +1,14 @@
+[project]
+name = "na-imputation"
+version = "0.1.0"
+description = "NA-profile classification and class-specific imputation for LFQ proteomics"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "openpyxl",
+    "scipy",
+    "scikit-learn",
+    "statsmodels",
+    "matplotlib>=3.7",
+]

@@ -1,0 +1,11 @@
+# never commit data or outputs (clinical proteomics)
+data/
+results/
+*.xlsx
+*.xls
+*.csv
+!examples/**/*.csv
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
