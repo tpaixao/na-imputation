@@ -12,7 +12,8 @@ imputed accordingly:
     Sparse (drop)     < 70% presence in every group            -> dropped
 
 Groups default to the letter prefix of the patient ID (Control01 -> Control); any per-sample
-label works (--group-col diagnosis, or --groups-file). Groups with fewer than --min-group-size patients are left out of the group
+label works: a column of a sample sheet (--sample-sheet samples.csv --group-col subtype), a
+field parsed from the sample ID (--group-col diagnosis) or a two-column --groups-file. Groups with fewer than --min-group-size patients are left out of the group
 screen and the presence rule (their samples are still modelled and imputed). The group test
 is Fisher's exact test for 2 groups and its k x 2 extension (Freeman-Halton, Monte Carlo over
 patient-label permutations) for k > 2.
@@ -155,8 +156,52 @@ def load_groups(path, meta: pd.DataFrame) -> pd.Series:
     return out.rename("na_group")
 
 
+RESERVED_META = ("n_detected", "na_group", "polish_shift")  # computed by the workflow
+
+
+def load_sample_sheet(path, sheet=0) -> pd.DataFrame:
+    """Read a sample sheet (.csv / .tsv / Excel), one row per sample, indexed by its `sample_id` column."""
+    df = read_matrix(path, sheet)
+    if "sample_id" not in df.columns:
+        raise ValueError(f"{path}: sample sheet needs a 'sample_id' column (found: {list(df.columns)})")
+    df["sample_id"] = df["sample_id"].astype(str).str.strip()
+    dup = df["sample_id"][df["sample_id"].duplicated()].unique()
+    if len(dup):
+        raise ValueError(f"{path}: duplicated sample_id: {list(dup)[:10]}")
+    return df.set_index("sample_id")
+
+
+def apply_sample_sheet(meta: pd.DataFrame, sample_sheet: pd.DataFrame, verbose=True) -> pd.DataFrame:
+    """Merge sample-sheet columns into meta (sheet values win, e.g. `patient` replaces the ID-parsed one).
+
+    Every sample in the matrix must have a row; rows for samples not in the matrix are ignored.
+    """
+    missing = meta.index.difference(sample_sheet.index)
+    if len(missing):
+        raise ValueError(f"{len(missing)} sample(s) in the matrix have no row in the sample sheet: "
+                         f"{list(missing)[:10]}")
+    extra = sample_sheet.index.difference(meta.index)
+    if len(extra) and verbose:
+        print(f"[sample-sheet] ignoring {len(extra)} row(s) for samples not in the matrix: {list(extra)[:10]}")
+    clash = [c for c in sample_sheet.columns if c in RESERVED_META]
+    if clash:
+        raise ValueError(f"sample sheet columns {clash} are reserved (computed by the workflow); rename them")
+
+    out = meta.copy()
+    for col in sample_sheet.columns:
+        out[col] = sample_sheet[col].reindex(meta.index)
+    if "patient" in sample_sheet.columns:
+        if out["patient"].isna().any():
+            raise ValueError(f"empty 'patient' for samples: {list(out.index[out['patient'].isna()])[:10]}")
+        out["patient"] = out["patient"].astype(str)
+    return out
+
+
 def resolve_groups(meta: pd.DataFrame, cfg: NAConfig, groups=None) -> pd.Series:
     """Per-sample group labels (from `groups` if given, else meta[cfg.group_col]); must be constant per patient."""
+    if groups is None and cfg.group_col not in meta.columns:
+        raise ValueError(f"group column '{cfg.group_col}' not found; available: "
+                         f"{[c for c in meta.columns if c not in RESERVED_META]}")
     g = meta[cfg.group_col] if groups is None else pd.Series(groups).reindex(meta.index)
     if g.isna().any():
         raise ValueError(f"no group label for samples: {list(g.index[g.isna()])}")
@@ -382,15 +427,24 @@ def impute_by_class(X, profile, P_miss, cfg: NAConfig, X_ref=None):
 # ------------------------------------------------------------------ workflow
 
 def run_workflow(lfq_path, cfg: NAConfig = None, out_dir=DEFAULT_OUT, groups=None,
-                 report=False, sheet=0, verbose=True) -> NAResult:
+                 report=False, sheet=0, sample_sheet=None, verbose=True) -> NAResult:
     """Load -> detection model -> per-protein profile -> classes -> imputation -> (save).
 
+    sample_sheet: optional per-sample metadata (path to .csv/.tsv/Excel, or a DataFrame) with a
+    `sample_id` column; its columns join the metadata (a `patient` column replaces the
+    ID-parsed patient) and any of them can be chosen with cfg.group_col.
     groups: optional per-sample labels (Series indexed by sample_id, or a path to a CSV for
     load_groups); overrides cfg.group_col.
     report: also write figures, tables and report.html to <out_dir>/report (see na_report).
     """
     cfg = cfg or NAConfig()
     X, prot, meta = load_lfq(lfq_path, sheet=sheet, verbose=verbose)
+    if sample_sheet is not None:
+        ss = sample_sheet if isinstance(sample_sheet, pd.DataFrame) else load_sample_sheet(sample_sheet)
+        if "sample_id" in ss.columns:
+            ss = ss.set_index("sample_id")
+        ss.index = ss.index.astype(str)
+        meta = apply_sample_sheet(meta, ss, verbose=verbose)
     if isinstance(groups, (str, Path)):
         groups = load_groups(groups, meta)
     meta["na_group"] = resolve_groups(meta, cfg, groups)
@@ -421,7 +475,8 @@ def run_workflow(lfq_path, cfg: NAConfig = None, out_dir=DEFAULT_OUT, groups=Non
         save_outputs(res, out_dir, verbose=verbose)
         if report:
             from na_report import make_report
-            path = make_report(res, Path(out_dir) / "report", source=lfq_path)
+            path = make_report(res, Path(out_dir) / "report", source=lfq_path,
+                               sample_sheet=None if isinstance(sample_sheet, pd.DataFrame) else sample_sheet)
             if verbose:
                 print("report:", path)
     return res
@@ -454,6 +509,9 @@ def main(argv=None):
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--report", action="store_true",
                     help="also write figures, tables and report.html to <out-dir>/report")
+    ap.add_argument("--sample-sheet", type=Path, default=None,
+                    help="per-sample metadata (.csv/.tsv/Excel) with a sample_id column; optional patient "
+                         "column; pick the grouping column with --group-col")
     ap.add_argument("--groups-file", type=Path, default=None,
                     help="CSV (sample_id or patient, group); overrides --group-col")
     for f in fields(NAConfig):
@@ -461,7 +519,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     cfg = NAConfig(**{f.name: getattr(args, f.name) for f in fields(NAConfig)})
     sheet = int(args.sheet) if args.sheet.isdigit() else args.sheet
-    run_workflow(args.lfq, cfg, args.out_dir, groups=args.groups_file, report=args.report, sheet=sheet)
+    run_workflow(args.lfq, cfg, args.out_dir, groups=args.groups_file, report=args.report, sheet=sheet,
+                 sample_sheet=args.sample_sheet)
 
 
 if __name__ == "__main__":

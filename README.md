@@ -141,13 +141,52 @@ given). Columns:
 | `Median` | optional; ignored |
 | one column per sample | log2 intensity, empty = missing, named by sample ID |
 
-**Sample IDs** are dot-separated: `PatientID[.fields…][.L|R][.diagnosis…]`, e.g. `Disease05.L`.
-- The patient ID is the first field. Samples sharing it are treated as one patient, e.g. left and
-  right samples.
-- The default group is the patient ID's leading letters: `Disease05` → `Disease`.
-- An `L`/`R` field marks the side. Fields after it form the `diagnosis` label, usable with
+### Sample metadata
+
+Each sample needs a **patient** and a **group**. There are three ways to provide them, from most
+to least explicit.
+
+**1. A sample sheet (`--sample-sheet`, recommended).** A `.csv`, `.tsv` or Excel file with one row
+per sample:
+
+```csv
+sample_id,patient,group,subtype,side,batch
+Control01.R,Control01,Control,Control,R,B1
+Disease05.L,Disease05,Disease,DiseaseA,L,B1
+Disease05.R,Disease05,Disease,DiseaseA,R,B1
+...
+```
+
+| Column | Required | Meaning |
+|---|---|---|
+| `sample_id` | yes | must match the matrix column names |
+| `patient` | no | samples sharing it are one patient: presence is counted once per patient, the group test works at patient level, and labels must agree within a patient. Replaces the patient parsed from the sample ID. |
+| any other | no | available as a grouping with `--group-col <column>` (e.g. `group`, `subtype`, `batch`) and listed in the report's `sample_qc` table |
+
+With a sample sheet, sample IDs can be anything (`S01`, `run_2024_117`, …).
+- The module stops with an error if a matrix sample has no row in the sheet, or if `--group-col`
+  names a column that doesn't exist.
+- It also stops if a patient's samples carry different labels.
+- Rows for samples not in the matrix are ignored, with a note.
+- `n_detected`, `na_group` and `polish_shift` are reserved column names.
+
+```bash
+python na_imputation.py --lfq matrix.csv --sample-sheet samples.csv                     # group column "group"
+python na_imputation.py --lfq matrix.csv --sample-sheet samples.csv --group-col subtype
+```
+
+**2. A two-column groups file (`--groups-file`).** `(sample_id or patient, group)`; see
+[More than two groups](#more-than-two-groups). It overrides `--group-col`. It can be combined
+with a sample sheet, which then only provides the patients.
+
+**3. Parsed from the sample IDs (fallback).** IDs are dot-separated:
+`PatientID[.fields…][.L|R][.diagnosis…]`, e.g. `Disease05.L`.
+- The patient ID is the first field.
+- The default `group` is its leading letters: `Disease05` → `Disease`.
+- An `L`/`R` field marks the side; the fields after it form `diagnosis`, usable with
   `--group-col diagnosis`.
-- Any other grouping can be supplied with `--groups-file`.
+
+A sample sheet overrides any of these parsed fields.
 
 Non-numeric cells are reported and treated as missing. Proteins with no observed value at all are
 reported and removed.
@@ -182,7 +221,8 @@ python na_imputation.py --lfq matrix.csv \
 | `--sheet` | first sheet | Excel sheet name or index |
 | `--out-dir` | `results/` | where the four CSVs are written |
 | `--report` | off | also write tables, figures and `report.html` to `<out-dir>/report/` |
-| `--group-col` | `group` | per-sample label column: `group` (patient-ID prefix) or `diagnosis` (from the sample ID) |
+| `--group-col` | `group` | metadata column holding the group: any sample-sheet column, or `group` (patient-ID prefix) / `diagnosis` parsed from the sample ID |
+| `--sample-sheet` | – | per-sample metadata (`.csv`/`.tsv`/Excel) with a `sample_id` column; optional `patient`; any column usable with `--group-col` |
 | `--groups-file` | – | CSV `(sample_id or patient, group)` with custom labels; overrides `--group-col` |
 | `--min-group-size` | `3` | groups with fewer patients are left out of the group screen and the presence rule |
 | `--presence-threshold` | `0.70` | keep a protein if detected in ≥ this fraction of patients in ≥ 1 group |
@@ -206,6 +246,8 @@ from na_imputation import NAConfig, run_workflow      # run from the repository 
 res = run_workflow("matrix.csv")                                           # defaults, writes results/
 res = run_workflow("matrix.csv", cfg=NAConfig(censor_cell_p=0.4), out_dir=None, verbose=False)  # no files
 res = run_workflow("matrix.csv", cfg=NAConfig(group_col="diagnosis"), out_dir=None)            # other grouping
+res = run_workflow("matrix.csv", sample_sheet="samples.csv", cfg=NAConfig(group_col="subtype"))  # sample sheet
+res = run_workflow("matrix.csv", sample_sheet=samples_df, out_dir=None)   # DataFrame with a sample_id column
 res = run_workflow("matrix.csv", groups="my_groups.csv", out_dir=None)                         # custom labels
 res = run_workflow("matrix.csv", groups=my_series, out_dir=None)   # pd.Series indexed by sample_id
 res = run_workflow("matrix.csv", report=True)                      # + results/report/
@@ -239,6 +281,8 @@ cross-validation fold:
 | `load_lfq(path, sheet=0)` | read the matrix → `(X, prot, meta)`; reports non-numeric cells and empty proteins |
 | `read_matrix(path, sheet=0)` | read `.csv` / `.tsv` / Excel into a DataFrame |
 | `parse_sample_id(id)` | `Disease05.L` → patient, group, side, diagnosis |
+| `load_sample_sheet(path, sheet=0)` | read a sample sheet → DataFrame indexed by `sample_id` |
+| `apply_sample_sheet(meta, sample_sheet)` | merge its columns into the metadata (validated; `patient` overrides) |
 | `load_groups(path, meta)` | read a custom groups CSV → per-sample labels |
 | `resolve_groups(meta, cfg, groups=None)` | pick the labels and check they're constant within each patient |
 | `median_polish(X)` | → `(mu, sample_shift)` |
@@ -334,7 +378,7 @@ so the method can be checked against the truth.
 ```bash
 uv run examples/make_synthetic_data.py      # -> examples/synthetic/*.csv
 uv run na_imputation.py --lfq examples/synthetic/lfq_synthetic.csv \
-    --out-dir examples/synthetic/output --report
+    --sample-sheet examples/synthetic/sample_sheet.csv --out-dir examples/synthetic/output --report
 uv run examples/evaluate_synthetic.py       # -> examples/synthetic/output/evaluation_*.csv
 ```
 
@@ -360,8 +404,9 @@ This gives 28.0% missing overall. Twenty proteins are never observed and are rem
 
 **Files:** `lfq_synthetic.csv` (the input), `truth_proteins.csv` (built-in mechanism per protein),
 `truth_cells.csv` (why each value is missing: `observed` / `censored` / `mcar` / `absent`),
-`sample_info.csv`, `groups_subtypes.csv` and `groups_rare.csv` (the multi-group examples below),
-and `output/` (the four CSVs, the report and the evaluation).
+`truth_samples.csv` (simulated detection-limit offset per run), `sample_sheet.csv` (patient,
+group, subtype, side and batch per sample), `groups_rare.csv` (the minimum-group-size example
+below), and `output/` (the four CSVs, the report and the evaluation).
 
 **How well it recovers the truth** (`evaluate_synthetic.py`):
 
@@ -391,18 +436,20 @@ the detection model, so it can't absorb a real group effect.
 **Choosing the groups**
 
 ```bash
+python na_imputation.py --lfq matrix.csv --sample-sheet samples.csv --group-col subtype --report
 python na_imputation.py --lfq matrix.csv --group-col diagnosis --out-dir results/by_diagnosis --report
 python na_imputation.py --lfq matrix.csv --groups-file groups.csv --out-dir results/custom --report
 ```
 
-`groups.csv` has two columns. The first lists every **sample ID** or every **patient ID**; the
-second gives the group (see `examples/synthetic/groups_subtypes.csv`):
+The sample sheet is described under [Sample metadata](#sample-metadata). A `groups.csv` has two
+columns. The first lists every **sample ID** or every **patient ID**; the second gives the group
+(see `examples/synthetic/groups_rare.csv`):
 
 ```csv
 patient,group
 Control01,Control
-Disease01,DiseaseA
-Disease02,DiseaseB
+Disease06,Disease
+Disease07,DiseaseRare
 ...
 ```
 
@@ -425,7 +472,7 @@ decide the Sparse rule and the on/off call. On the synthetic data:
 | Run | Groups (patients) | Test | Group-structured | Sparse |
 |---|---|---|---|---|
 | default | Control 8, Disease 12 | Fisher | 27 | 170 |
-| `--groups-file groups_subtypes.csv` | Control 8, DiseaseA 6, DiseaseB 6 | Freeman–Halton | 29 | 150 |
+| `--sample-sheet sample_sheet.csv --group-col subtype` | Control 8, DiseaseA 6, DiseaseB 6 | Freeman–Halton | 29 | 150 |
 | `--groups-file groups_rare.csv` | Control 8, Disease 10, DiseaseRare 2 (excluded) | Fisher | 29 | 148 |
 | `--groups-file groups_rare.csv --min-group-size 1` | all three | Freeman–Halton | 29 | **130** |
 

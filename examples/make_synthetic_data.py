@@ -20,7 +20,11 @@ Writes to examples/synthetic/:
   lfq_synthetic.csv        proteins x samples (PG.ProteinAccessions, PG.Genes, Protein.Names, samples...)
   truth_proteins.csv       per protein: true abundance and built-in mechanism
   truth_cells.csv          per cell: observed / censored / mcar / absent (why the value is missing)
-  sample_info.csv          per sample: patient, group, side, LOD offset
+  sample_sheet.csv         per sample: sample_id, patient, group, subtype (Control / DiseaseA /
+                           DiseaseB), side, batch -- metadata for --sample-sheet
+  truth_samples.csv        per sample: LOD offset used in the simulation (3 shallow runs)
+  groups_rare.csv          two-column groups file with a 2-patient 'DiseaseRare' group
+                           (for the minimum-group-size example)
 
 Run from the repository root:  uv run examples/make_synthetic_data.py
 """
@@ -123,7 +127,20 @@ def main():
     truth.to_csv(OUT / "truth_proteins.csv", index=False)
     pd.concat([truth[["accession", "gene"]], pd.DataFrame(why, columns=samples.index)], axis=1) \
         .to_csv(OUT / "truth_cells.csv", index=False)
-    samples.round(3).to_csv(OUT / "sample_info.csv")
+    # sample sheet: disease patients alternate between two subtypes; two processing batches
+    disease = [p for p in patients if p.startswith("Disease")]
+    subtype = {p: ("Control" if p.startswith("Control") else ("DiseaseA" if disease.index(p) % 2 == 0 else "DiseaseB"))
+               for p in patients}
+    sheet = samples[["patient", "group"]].copy()
+    sheet["subtype"] = sheet["patient"].map(subtype)
+    sheet["side"] = samples["side"]
+    sheet["batch"] = np.where(np.arange(n_s) < n_s // 2, "B1", "B2")
+    sheet.to_csv(OUT / "sample_sheet.csv", index_label="sample_id")
+    samples[["lod_offset"]].round(3).to_csv(OUT / "truth_samples.csv", index_label="sample_id")
+    rare = {"Disease07", "Disease12"}
+    pd.DataFrame({"patient": patients,
+                  "group": ["Control" if p.startswith("Control") else ("DiseaseRare" if p in rare else "Disease")
+                            for p in patients]}).to_csv(OUT / "groups_rare.csv", index=False)
 
     miss = np.isnan(X)
     print(f"{N_PROT} proteins x {n_s} samples, {miss.mean():.1%} missing "

@@ -50,7 +50,8 @@ def _group_colors(res: NAResult) -> dict:
 
 
 def _short(res: NAResult, s: str) -> str:
-    return f"{res.meta.at[s, 'patient']}.{res.meta.at[s, 'side']}"
+    side = res.meta.at[s, "side"]
+    return f"{res.meta.at[s, 'patient']}.{side}" if isinstance(side, str) and side in ("L", "R") else str(s)
 
 
 def _samples_by_depth(res: NAResult, deep_first=True):
@@ -100,7 +101,13 @@ def report_tables(res: NAResult) -> dict:
 
     complete = ~M.any(axis=1)
     mp = minprob_params(X, cfg)
-    qc = meta[["patient", "side", "na_group", "n_detected", "polish_shift"]].copy()
+    base = ["patient", "side", "na_group"]
+    if not meta["side"].astype(str).isin(["L", "R"]).any():
+        base.remove("side")
+    # sample-sheet (or other extra) columns, but not the ID-parsed defaults
+    extra = [c for c in meta.columns if c not in {"patient", "side", "na_group", "group", "diagnosis",
+                                                    "n_detected", "polish_shift"}]
+    qc = meta[base + extra + ["n_detected", "polish_shift"]].copy()
     qc["median_complete_proteins"] = X[complete].median(axis=0) if complete.any() else np.nan
     qc["minprob_mean"], qc["minprob_sd"] = mp["loc"], mp["scale"]
     qc["n_MinProb"] = (res.method == "MinProb").sum()
@@ -386,7 +393,7 @@ def _table_html(df: pd.DataFrame) -> str:
     return '<div class="tbl">' + fmt.to_html(border=0, escape=True, na_rep="") + "</div>"
 
 
-def make_report(res: NAResult, out_dir, examples=None, source=None, fig_format="png") -> Path:
+def make_report(res: NAResult, out_dir, examples=None, source=None, fig_format="png", sample_sheet=None) -> Path:
     """Write tables/*.csv, figures/*.<fig_format> and a self-contained report.html. Returns the HTML path."""
     out_dir = Path(out_dir)
     (out_dir / "tables").mkdir(parents=True, exist_ok=True)
@@ -405,6 +412,7 @@ def make_report(res: NAResult, out_dir, examples=None, source=None, fig_format="
     sizes = res.meta.drop_duplicates("patient")["na_group"].value_counts().sort_index()
     kv = {
         "Input": html.escape(str(source)) if source else "–",
+        "Sample sheet": html.escape(str(sample_sheet)) if sample_sheet else "– (metadata parsed from sample IDs)",
         "Generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "Matrix": f"{X.shape[0]} proteins × {X.shape[1]} samples, {X.isna().values.mean():.1%} missing",
         "Groups (patients)": ", ".join(f"{html.escape(g)} = {n}" + ("" if g in res.groups_used else " (excluded)")
