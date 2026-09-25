@@ -1,0 +1,5 @@
+,value
+censored/absent cells given MinProb (of retained),0.753
+MCAR cells given kNN (of retained),0.948
+on/off proteins called Group-structured,1.0
+Group-structured calls that are true on/off,0.741

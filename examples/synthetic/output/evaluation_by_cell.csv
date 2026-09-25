@@ -1,0 +1,5 @@
+why_missing,MinProb,kNN,dropped,total
+absent,224,0,0,224
+censored,1137,446,3140,4723
+mcar,20,367,33,420
+total,1381,813,3173,5367

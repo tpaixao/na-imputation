@@ -1,0 +1,7 @@
+mechanism,Complete,MCAR - random,MNAR - censored,Mixed,Group-structured,Sparse (drop),(no observed value),total
+differential abundance (Disease +1.5),4,6,3,14,3,9,1,40
+flaky: 20% random dropout,1,27,0,1,1,0,0,30
+none,76,54,125,272,3,161,19,710
+on/off: absent in Control,0,0,0,0,12,0,0,12
+on/off: absent in Disease,0,0,0,0,8,0,0,8
+total,81,87,128,287,27,170,20,800

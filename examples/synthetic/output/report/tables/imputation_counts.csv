@@ -1,0 +1,8 @@
+na_class,MinProb,kNN,total
+Complete,0,0,0
+MCAR - random,0,223,223
+MNAR - censored,269,0,269
+Mixed,770,590,1360
+Group-structured,342,0,342
+Sparse (drop),0,0,0
+All retained,1381,813,2194
