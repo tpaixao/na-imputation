@@ -96,6 +96,7 @@ def report_tables(res: NAResult) -> dict:
     counts = pd.DataFrame({m: (res.method == m).sum(axis=1).groupby(cls, observed=False).sum()
                            for m in ["MinProb", "kNN"]})
     counts["total"] = counts.sum(axis=1)
+    counts.index = counts.index.astype(str)
     counts.loc["All retained"] = counts.sum()
     out["imputation_counts"] = counts
 
@@ -112,11 +113,11 @@ def report_tables(res: NAResult) -> dict:
     qc["minprob_mean"], qc["minprob_sd"] = mp["loc"], mp["scale"]
     qc["n_MinProb"] = (res.method == "MinProb").sum()
     qc["n_kNN"] = (res.method == "kNN").sum()
-    qc["frac_imputed_retained"] = (qc["n_MinProb"] + qc["n_kNN"]) / len(res.method)
+    qc["frac_imputed_retained"] = (qc["n_MinProb"] + qc["n_kNN"]) / len(res.method) if len(res.method) else np.nan
     out["sample_qc"] = qc.sort_values("n_detected")
 
     y, p = M.values.ravel(), res.P_miss.values.ravel()
-    _, model = fit_detection_model(X, res.mu)
+    model = res.det_model if res.det_model is not None else fit_detection_model(X, res.mu)[1]
     b = -model.coef_[0][0]
     out["detection_model"] = pd.DataFrame({
         "cells": [y.size], "frac_missing": [y.mean()], "abundance_slope_b": [b],
@@ -243,7 +244,10 @@ def fig_class_examples(res: NAResult, examples=None) -> Figure:
     axes = fig.subplots(2, 3, sharex=True)
     for ax, cls in zip(axes.ravel(), CLASS_ORDER):
         if examples and cls in examples:
-            i = prof.index[prof["gene"] == examples[cls]][0]
+            hits = prof.index[(prof["gene"] == examples[cls]) | (prof["accession"] == examples[cls])]
+            if not len(hits):
+                raise ValueError(f"example for {cls!r}: no protein with gene or accession {examples[cls]!r}")
+            i = hits[0]
         else:
             i = _pick_example(res, cls)
         if i is None:
@@ -279,7 +283,13 @@ def fig_imputed_distributions(res: NAResult) -> Figure:
     fig = Figure(figsize=(14, 2 * nrow + 0.4), layout="constrained")
     axes = np.atleast_2d(fig.subplots(nrow, ncol, sharex=True, sharey=True))
     Xk, meth, Xi = res.X.loc[res.method.index], res.method, res.X_imputed
-    bins = np.linspace(np.nanmin(Xi.values), np.nanmax(Xi.values), 40)
+    if Xi.empty:
+        axes.ravel()[0].text(0.5, 0.5, "No retained proteins", ha="center", va="center", color=INK2)
+        for ax in axes.ravel():
+            ax.set_axis_off()
+        return fig
+    lo, hi = np.nanmin(Xi.values), np.nanmax(Xi.values)
+    bins = np.linspace(lo, hi if hi > lo else lo + 1, 40)
     for ax, s in zip(axes.ravel(), s_order):
         ax.hist(Xk[s].dropna(), bins=bins, color="#c3c2b7")
         ax.hist(Xi.loc[meth[s] == "kNN", s], bins=bins, color=SLOTS[1], alpha=0.85)
@@ -419,7 +429,7 @@ def make_report(res: NAResult, out_dir, examples=None, source=None, fig_format="
                                        for g, n in sizes.items()),
         "Group test": html.escape(res.group_test),
         "Retained": f"{len(res.X_imputed)} proteins; {int((res.method != '').values.sum())} cells imputed",
-        "Settings": ", ".join(f"{k}={v}" for k, v in asdict(cfg).items()),
+        "Settings": html.escape(", ".join(f"{k}={v}" for k, v in asdict(cfg).items())),
     }
     parts = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
              f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -431,7 +441,7 @@ def make_report(res: NAResult, out_dir, examples=None, source=None, fig_format="
     for sid, title, tnames, fnames, note in SECTIONS:
         parts.append(f"<h2 id='{sid}'>{title}</h2><p class='note'>{html.escape(note)}</p>")
         for f in fnames:
-            parts.append(f"<figure><img alt='{f}' src='data:image/png;base64,{_img(figs[f])}'></figure>")
+            parts.append(f"<figure><img alt='{html.escape(f)}' src='data:image/png;base64,{_img(figs[f])}'></figure>")
         for t in tnames:
             parts.append(f"<h3 style='font-size:14px;margin:16px 0 4px'>{t.replace('_', ' ')}</h3>{_table_html(tables[t])}")
     parts.append("</main></body></html>")

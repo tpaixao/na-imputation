@@ -13,9 +13,10 @@ imputed accordingly:
 
 Groups default to the letter prefix of the patient ID (Control01 -> Control); any per-sample
 label works: a column of a sample sheet (--sample-sheet samples.csv --group-col subtype), a
-field parsed from the sample ID (--group-col diagnosis) or a two-column --groups-file. Groups with fewer than --min-group-size patients are left out of the group
-screen and the presence rule (their samples are still modelled and imputed). The group test
-is Fisher's exact test for 2 groups and its k x 2 extension (Freeman-Halton, Monte Carlo over
+field parsed from the sample ID (--group-col diagnosis) or a two-column --groups-file.
+Groups with fewer than --min-group-size patients are left out of the group screen and the
+presence rule (their samples are still modelled and imputed). The group test is Fisher's
+exact test for 2 groups and its k x 2 extension (Freeman-Halton, Monte Carlo over
 patient-label permutations) for k > 2.
 
 Usage as a script (writes the four CSVs, plus figures/tables/HTML with --report):
@@ -33,7 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy import stats
+from scipy import sparse, stats
 from scipy.special import gammaln
 from sklearn.impute import KNNImputer
 from sklearn.linear_model import LogisticRegression
@@ -78,6 +79,7 @@ class NAResult:
     groups_used: list         # groups that entered the group screen (>= min_group_size patients)
     group_test: str           # name of the test used for group_p
     cfg: NAConfig = None      # configuration the result was produced with
+    det_model: object = None  # fitted detection model (LogisticRegression)
 
 
 # ------------------------------------------------------------------ loading
@@ -89,6 +91,7 @@ def parse_sample_id(sample_id: str) -> dict:
     Case7 -> Case); side = first "L"/"R" field (samples of one patient share the patient ID);
     diagnosis = fields after the side, joined with "+".
     """
+    sample_id = str(sample_id)
     parts = sample_id.split(".")
     patient = parts[0]
     prefix = re.match(r"[A-Za-z]+", patient)
@@ -112,23 +115,49 @@ def read_matrix(path, sheet=0) -> pd.DataFrame:
 def load_lfq(path, sheet=0, verbose=True):
     """Return (X, prot, meta). Non-numeric cells are reported and set to NaN.
 
-    Expected columns: PG.ProteinAccessions, PG.Genes, Protein.Names (optional: Median), then one
-    log2 intensity column per sample, named by sample ID (see parse_sample_id).
+    Expected columns: PG.ProteinAccessions (required), PG.Genes and Protein.Names (optional),
+    Median (optional, ignored), then one log2 intensity column per sample, named by sample ID
+    (see parse_sample_id). Columns without any numeric value are not samples: text-only
+    columns are ignored and empty columns dropped, both with a note. Proteins with no
+    observed value are removed.
     """
     raw = read_matrix(path, sheet)
-    sample_cols = [c for c in raw.columns if c not in ID_COLS]
-    meta = pd.DataFrame([parse_sample_id(c) for c in sample_cols]).set_index("sample_id")
+    raw.columns = [str(c).strip() for c in raw.columns]
+    if "PG.ProteinAccessions" not in raw.columns:
+        raise ValueError(f"{path}: missing required column 'PG.ProteinAccessions' "
+                         f"(found: {list(raw.columns)[:10]})")
+    if raw.columns.duplicated().any():
+        raise ValueError(f"{path}: duplicated column names: {list(raw.columns[raw.columns.duplicated()])}")
+    candidates = [c for c in raw.columns if c not in ID_COLS]
 
-    X_raw = raw[sample_cols]
+    X_raw = raw[candidates]
     X = X_raw.apply(pd.to_numeric, errors="coerce")
-    if verbose:
-        for r, c in zip(*np.where(X.isna() & X_raw.notna())):
-            print(f"[data-quality] non-numeric cell coerced to NaN: gene={raw['PG.Genes'][r]} "
-                  f"sample={sample_cols[c]} value={X_raw.iat[r, c]!r}")
+    has_number = X.notna().any(axis=0)
+    text_cols = [c for c in candidates if not has_number[c] and X_raw[c].notna().any()]
+    empty_cols = [c for c in candidates if not has_number[c] and not X_raw[c].notna().any()]
+    if verbose and text_cols:
+        print(f"[data-quality] ignored {len(text_cols)} non-numeric column(s) (not samples): {text_cols[:10]}")
+    if verbose and empty_cols:
+        print(f"[data-quality] dropped {len(empty_cols)} empty column(s): {empty_cols[:10]}")
+    sample_cols = [c for c in candidates if has_number[c]]
+    if len(sample_cols) < 2:
+        raise ValueError(f"{path}: need at least 2 sample columns with numeric values, found {len(sample_cols)}")
+    X, X_raw = X[sample_cols], X_raw[sample_cols]
 
-    prot = raw[["PG.ProteinAccessions", "PG.Genes", "Protein.Names"]].rename(
-        columns={"PG.ProteinAccessions": "accession", "PG.Genes": "gene", "Protein.Names": "protein_name"})
-    prot["gene"] = prot["gene"].fillna(prot["accession"])
+    bad = X.isna() & X_raw.notna()
+    if verbose and bad.values.any():
+        acc = raw["PG.ProteinAccessions"]
+        cells = list(zip(*np.where(bad.values)))
+        for r, c in cells[:10]:
+            print(f"[data-quality] non-numeric cell coerced to NaN: protein={acc.iat[r]} "
+                  f"sample={sample_cols[c]} value={X_raw.iat[r, c]!r}")
+        if len(cells) > 10:
+            print(f"[data-quality] ... {len(cells) - 10} more non-numeric cell(s) coerced to NaN")
+
+    prot = pd.DataFrame({"accession": raw["PG.ProteinAccessions"].astype(str)}, index=raw.index)
+    prot["gene"] = raw["PG.Genes"] if "PG.Genes" in raw.columns else np.nan
+    prot["gene"] = prot["gene"].fillna(prot["accession"]).astype(str)
+    prot["protein_name"] = raw["Protein.Names"] if "Protein.Names" in raw.columns else ""
     X.index = prot.index
 
     empty = X.isna().all(axis=1)
@@ -136,16 +165,24 @@ def load_lfq(path, sheet=0, verbose=True):
         if verbose:
             print(f"[data-quality] removed {int(empty.sum())} protein(s) with no observed value")
         X, prot = X[~empty], prot[~empty]
+
+    meta = pd.DataFrame([parse_sample_id(c) for c in sample_cols]).set_index("sample_id")
     meta["n_detected"] = X.notna().sum(axis=0)
     return X, prot, meta
 
 
 def load_groups(path, meta: pd.DataFrame) -> pd.Series:
     """Read a 2-column CSV (id, group) keyed by sample_id or by patient -> per-sample labels."""
-    g = pd.read_csv(path)
+    g = read_matrix(path)
     if g.shape[1] < 2:
         raise ValueError(f"{path}: expected two columns (sample_id or patient, group)")
-    ids, labels = g.iloc[:, 0].astype(str), g.iloc[:, 1].astype(str)
+    g = g.iloc[:, :2].dropna(how="all")
+    if g.iloc[:, 0].isna().any() or g.iloc[:, 1].isna().any():
+        raise ValueError(f"{path}: empty id or group in rows {list(g.index[g.isna().any(axis=1)] + 2)[:10]}")
+    ids, labels = g.iloc[:, 0].map(_as_id), g.iloc[:, 1].astype(str).str.strip()
+    conflict = pd.DataFrame({"id": ids, "label": labels}).groupby("id")["label"].nunique()
+    if (conflict > 1).any():
+        raise ValueError(f"{path}: conflicting groups for ids {list(conflict.index[conflict > 1])[:10]}")
     lookup = dict(zip(ids, labels))
     if set(meta.index) <= set(ids):
         out = meta.index.to_series().map(lookup)
@@ -159,16 +196,32 @@ def load_groups(path, meta: pd.DataFrame) -> pd.Series:
 RESERVED_META = ("n_detected", "na_group", "polish_shift")  # computed by the workflow
 
 
+def _as_id(v) -> str:
+    """ID as text; integral floats (Excel's 7.0) become '7'."""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def prepare_sample_sheet(df: pd.DataFrame, source="sample sheet") -> pd.DataFrame:
+    """Validate a sample sheet (a `sample_id` column or index) -> copy indexed by sample_id (text)."""
+    df = df.copy()
+    if "sample_id" in df.columns:
+        df = df.set_index("sample_id")
+    elif df.index.name != "sample_id":
+        raise ValueError(f"{source}: needs a 'sample_id' column (found: {list(df.columns)})")
+    if df.index.isna().any():
+        raise ValueError(f"{source}: empty sample_id in {int(df.index.isna().sum())} row(s)")
+    df.index = pd.Index([_as_id(v) for v in df.index], name="sample_id")
+    dup = df.index[df.index.duplicated()].unique()
+    if len(dup):
+        raise ValueError(f"{source}: duplicated sample_id: {list(dup)[:10]}")
+    return df
+
+
 def load_sample_sheet(path, sheet=0) -> pd.DataFrame:
     """Read a sample sheet (.csv / .tsv / Excel), one row per sample, indexed by its `sample_id` column."""
-    df = read_matrix(path, sheet)
-    if "sample_id" not in df.columns:
-        raise ValueError(f"{path}: sample sheet needs a 'sample_id' column (found: {list(df.columns)})")
-    df["sample_id"] = df["sample_id"].astype(str).str.strip()
-    dup = df["sample_id"][df["sample_id"].duplicated()].unique()
-    if len(dup):
-        raise ValueError(f"{path}: duplicated sample_id: {list(dup)[:10]}")
-    return df.set_index("sample_id")
+    return prepare_sample_sheet(read_matrix(path, sheet), source=str(path))
 
 
 def apply_sample_sheet(meta: pd.DataFrame, sample_sheet: pd.DataFrame, verbose=True) -> pd.DataFrame:
@@ -193,7 +246,7 @@ def apply_sample_sheet(meta: pd.DataFrame, sample_sheet: pd.DataFrame, verbose=T
     if "patient" in sample_sheet.columns:
         if out["patient"].isna().any():
             raise ValueError(f"empty 'patient' for samples: {list(out.index[out['patient'].isna()])[:10]}")
-        out["patient"] = out["patient"].astype(str)
+        out["patient"] = out["patient"].map(_as_id)
     return out
 
 
@@ -228,8 +281,13 @@ def median_polish(X: pd.DataFrame, n_iter: int = 30):
 def fit_detection_model(X: pd.DataFrame, mu: pd.Series):
     """logit P(missing_ij) = a_j - b * mu_i. Returns (P_miss DataFrame, fitted model)."""
     n_p, n_s = X.shape
-    design = np.column_stack([np.repeat(mu.values, n_s), np.tile(np.eye(n_s), (n_p, 1))])
     y = X.isna().values.ravel().astype(int)
+    if y.min() == y.max():
+        raise ValueError("the matrix has no missing values (or only missing values): nothing to classify")
+    # cells in row-major order: column 0 = abundance, columns 1..n_s = one-hot sample (sparse)
+    rows = np.arange(n_p * n_s)
+    onehot = sparse.csr_matrix((np.ones(n_p * n_s), (rows, np.tile(np.arange(n_s), n_p))), shape=(n_p * n_s, n_s))
+    design = sparse.hstack([sparse.csr_matrix(np.repeat(mu.values, n_s)[:, None]), onehot], format="csr")
     model = LogisticRegression(C=1e3, max_iter=5000).fit(design, y)
     P_miss = pd.DataFrame(model.predict_proba(design)[:, 1].reshape(n_p, n_s), index=X.index, columns=X.columns)
     return P_miss, model
@@ -268,16 +326,18 @@ def presence_group_test(present: np.ndarray, labels: np.ndarray, n_perm: int, rn
     P = present.astype(float)
 
     if k == 2:
-        a = P @ onehot                                              # proteins x 2 detected counts
-        p = np.array([stats.fisher_exact([[x, n_g[0] - x], [y, n_g[1] - y]])[1] for x, y in a])
+        a = np.rint(P @ onehot).astype(int)                         # proteins x 2 detected counts
+        n0, n1 = int(n_g[0]), int(n_g[1])
+        p = np.array([stats.fisher_exact([[x, n0 - x], [y, n1 - y]])[1] for x, y in a], dtype=float)
         return p, "Fisher exact (2x2)"
 
     total = P.sum(axis=1)
     ok = (total > 0) & (total < P.shape[1])
+    P_ok = P[ok]
     lg_n = gammaln(n_g + 1)
 
     def log_prob(oh):  # sum_g log C(n_g, a_g), up to a per-protein constant
-        a = P[ok] @ oh
+        a = P_ok @ oh
         return (lg_n - gammaln(a + 1) - gammaln(n_g - a + 1)).sum(axis=1)
 
     t_obs = log_prob(onehot)
@@ -311,6 +371,11 @@ def na_profile(X, prot, meta, mu, P_miss, groups: pd.Series, cfg: NAConfig):
     used = sorted(sizes.index[sizes >= cfg.min_group_size])
 
     presence = pd.DataFrame({g: pat_present.loc[:, pat_group == g].mean(axis=1) for g in sorted(sizes.index)})
+    names = pd.Series({g: _col(g) for g in presence.columns})
+    clash = names[names.duplicated(keep=False) | names.isin(["presence_spread"])]
+    if len(clash):
+        raise ValueError(f"group names {list(clash.index)} map to the same/ reserved column name(s) "
+                         f"{sorted(set(clash))}; rename the groups")
     out = prot.assign(n_missing=n_miss, frac_missing=n_miss / n_s, mu_hat=mu.round(3),
                       frac_censored=frac_censored, mean_p_at_missing=cell_p.mean(axis=1), depth_auc=auc_depth)
     for g in presence.columns:
@@ -390,13 +455,19 @@ def assign_methods(M: pd.DataFrame, P_miss: pd.DataFrame, classes: pd.Series, cf
 
 def knn_impute(X: pd.DataFrame, k: int) -> pd.DataFrame:
     """Protein-wise kNN (neighbours = proteins, as impute::impute.knn); donors are observed values only."""
-    filled = KNNImputer(n_neighbors=k, weights="distance").fit_transform(X.values)
+    if X.empty:
+        return X.copy()
+    filled = KNNImputer(n_neighbors=k, weights="distance", keep_empty_features=True).fit_transform(X.values)
     return pd.DataFrame(filled, index=X.index, columns=X.columns)
 
 
 def minprob_params(X_ref: pd.DataFrame, cfg: NAConfig) -> pd.DataFrame:
     """Per-sample N(mean - shift*sd, (width*sd)^2), from that sample's observed values."""
     mean, sd = X_ref.mean(axis=0), X_ref.std(axis=0)
+    # a sample with < 2 observed values has no sd: use the median sd of the other samples
+    sd = sd.fillna(sd.median())
+    if mean.isna().any() or sd.isna().any():
+        raise ValueError(f"MinProb needs observed values in every sample; none in {list(mean.index[mean.isna()])}")
     return pd.DataFrame({"loc": mean - cfg.minprob_shift * sd, "scale": cfg.minprob_width * sd})
 
 
@@ -410,6 +481,8 @@ def impute_by_class(X, profile, P_miss, cfg: NAConfig, X_ref=None):
     keep = profile["na_class"] != "Sparse (drop)"
     Xk = X[keep.values]
     method = assign_methods(Xk.isna(), P_miss, profile.loc[keep, "na_class"], cfg)
+    if Xk.empty:
+        return Xk.copy(), method
 
     X_imp = Xk.mask(method == "kNN", knn_impute(Xk, cfg.knn_k))
 
@@ -438,19 +511,19 @@ def run_workflow(lfq_path, cfg: NAConfig = None, out_dir=DEFAULT_OUT, groups=Non
     report: also write figures, tables and report.html to <out_dir>/report (see na_report).
     """
     cfg = cfg or NAConfig()
+    if report and out_dir is None:
+        raise ValueError("report=True needs an out_dir (the report is written to <out_dir>/report)")
     X, prot, meta = load_lfq(lfq_path, sheet=sheet, verbose=verbose)
     if sample_sheet is not None:
-        ss = sample_sheet if isinstance(sample_sheet, pd.DataFrame) else load_sample_sheet(sample_sheet)
-        if "sample_id" in ss.columns:
-            ss = ss.set_index("sample_id")
-        ss.index = ss.index.astype(str)
+        ss = (prepare_sample_sheet(sample_sheet) if isinstance(sample_sheet, pd.DataFrame)
+              else load_sample_sheet(sample_sheet))
         meta = apply_sample_sheet(meta, ss, verbose=verbose)
     if isinstance(groups, (str, Path)):
         groups = load_groups(groups, meta)
     meta["na_group"] = resolve_groups(meta, cfg, groups)
     mu, shift = median_polish(X)
     meta["polish_shift"] = shift
-    P_miss, _ = fit_detection_model(X, mu)
+    P_miss, det_model = fit_detection_model(X, mu)
 
     profile, used, test_name = na_profile(X, prot, meta, mu, P_miss, meta["na_group"], cfg)
     profile["na_class"] = classify_proteins(profile, cfg)
@@ -458,7 +531,8 @@ def run_workflow(lfq_path, cfg: NAConfig = None, out_dir=DEFAULT_OUT, groups=Non
 
     X_imp, method = impute_by_class(X, profile, P_miss, cfg)
     presence = X.notna().astype(int)
-    res = NAResult(X, prot, meta, mu, shift, P_miss, profile, method, X_imp, presence, used, test_name, cfg)
+    res = NAResult(X, prot, meta, mu, shift, P_miss, profile, method, X_imp, presence, used, test_name, cfg,
+                   det_model)
 
     if verbose:
         M = X.isna()

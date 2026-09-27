@@ -10,6 +10,7 @@ a self-contained HTML page.
 | `na_imputation.py` | classification, imputation, full workflow, command-line interface |
 | `na_report.py` | report tables, figures and HTML (`--report`) |
 | `examples/` | synthetic dataset with known mechanisms, its full output and report, and an evaluation against the truth |
+| `tests/` | pytest suite (`uv run pytest`) |
 | `pyproject.toml` | dependencies |
 
 All numbers below come from the **synthetic example** in `examples/` (see [Example](#example-synthetic-data)).
@@ -135,11 +136,15 @@ given). Columns:
 
 | Column | Meaning |
 |---|---|
-| `PG.ProteinAccessions` | protein accession |
-| `PG.Genes` | gene name (missing values fall back to the accession) |
-| `Protein.Names` | description |
+| `PG.ProteinAccessions` | protein accession (required) |
+| `PG.Genes` | gene name (optional; missing values fall back to the accession) |
+| `Protein.Names` | description (optional) |
 | `Median` | optional; ignored |
 | one column per sample | log2 intensity, empty = missing, named by sample ID |
+
+Every other column is treated as a sample **if it contains at least one number**. So remove
+numeric annotation columns (e.g. precursor counts) before running. Text-only columns are ignored
+and empty columns dropped, both with a note.
 
 ### Sample metadata
 
@@ -188,8 +193,9 @@ with a sample sheet, which then only provides the patients.
 
 A sample sheet overrides any of these parsed fields.
 
-Non-numeric cells are reported and treated as missing. Proteins with no observed value at all are
-reported and removed.
+Non-numeric cells in sample columns are reported (the first 10, then a count) and treated as
+missing. Proteins with no observed value at all are reported and removed. Duplicated column names,
+fewer than two sample columns, or a matrix with no missing values stop the run with an error.
 
 ## Requirements
 
@@ -202,6 +208,19 @@ uv run na_imputation.py --lfq examples/synthetic/lfq_synthetic.csv --out-dir res
 
 `uv` creates the environment on first use. Alternatively, `pip install numpy pandas openpyxl scipy
 scikit-learn statsmodels matplotlib` and run it with `python`.
+
+Tests: `uv run pytest` (about 1 minute).
+- **Loading:** CSV / TSV / Excel give identical results; messy columns; numeric sample names.
+- **Metadata:** groups files and sample sheets, including every validation error.
+- **Statistics:** the group tests are checked against SciPy, and median polish is checked on
+  exact data.
+- **Workflow:** observed values untouched, one method per missing cell, classes follow the
+  documented rules, reproducible with a seed; k groups and minimum group size.
+- **Edge cases:** nothing retained, a sample with one value, a complete matrix.
+- **CLI and report.**
+
+Scale: a 5,864-protein × 100-sample matrix runs in about 70 s with under 400 MB peak memory (the
+detection model uses a sparse design matrix).
 
 ## Command line
 
@@ -269,6 +288,7 @@ res = run_workflow("matrix.csv", report=True)                      # + results/r
 | `groups_used` | list | groups that entered the group screen (≥ `min_group_size` patients) |
 | `group_test` | str | name of the test behind `group_p` |
 | `cfg` | `NAConfig` | the settings used |
+| `det_model` | `LogisticRegression` | the fitted detection model |
 
 Rows in every table share the same integer index (the row number in the input), so they line up
 directly. Gene names are not used as the index because they aren't guaranteed unique.
@@ -282,6 +302,7 @@ cross-validation fold:
 | `read_matrix(path, sheet=0)` | read `.csv` / `.tsv` / Excel into a DataFrame |
 | `parse_sample_id(id)` | `Disease05.L` → patient, group, side, diagnosis |
 | `load_sample_sheet(path, sheet=0)` | read a sample sheet → DataFrame indexed by `sample_id` |
+| `prepare_sample_sheet(df)` | validate a sample-sheet DataFrame (`sample_id` column or index) → indexed copy |
 | `apply_sample_sheet(meta, sample_sheet)` | merge its columns into the metadata (validated; `patient` overrides) |
 | `load_groups(path, meta)` | read a custom groups CSV → per-sample labels |
 | `resolve_groups(meta, cfg, groups=None)` | pick the labels and check they're constant within each patient |
